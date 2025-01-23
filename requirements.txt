@@ -1,0 +1,11 @@
+streamlit
+python-dotenv
+openai
+langsmith
+llama-index
+ipython
+pydantic
+torch
+transformers
+sentence-transformers
+pypdf
