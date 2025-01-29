@@ -29,6 +29,8 @@ from llama_index.core import VectorStoreIndex, ServiceContext, SimpleDirectoryRe
 from qdrant_client import QdrantClient
 from llama_index.vector_stores.qdrant import QdrantVectorStore
 from llama_index.core import StorageContext
+from qdrant_client.models import Filter, FieldCondition, MatchValue
+import hashlib
 
 # Configure page settings
 st.set_page_config(
@@ -268,9 +270,59 @@ class TracedHuggingFaceEmbedding(HuggingFaceEmbedding):
     def _get_text_embeddings(self, texts: List[str]) -> List[List[float]]:
         return super()._get_text_embeddings(texts)
 
+# Add this function to initialize existing collection
+@st.cache_resource
+def initialize_existing_index():
+    try:
+        client = QdrantClient(
+            url=os.getenv("QDRANT_URL"),
+            api_key=os.getenv("QDRANT_API_KEY"),
+            prefer_grpc=True,
+            https=True
+        )
+        
+        # Check if collection exists
+        client.get_collection("deepseek_rag_docs")
+        
+        # If exists, create index from existing store
+        vector_store = QdrantVectorStore(
+            client=client,
+            collection_name="deepseek_rag_docs"
+        )
+        
+        return VectorStoreIndex.from_vector_store(vector_store)
+    
+    except Exception:
+        return None
+
+# Modify the load_llm function to include embedding model
 @st.cache_resource
 def load_llm():
-    return DeepSeekLLM()
+    Settings.embed_model = TracedHuggingFaceEmbedding(
+        model_name="BAAI/bge-large-en-v1.5",
+        trust_remote_code=True
+    )
+    Settings.llm = DeepSeekLLM()
+    return Settings.llm
+
+# In the main execution flow, add this after loading the LLM
+llm = load_llm()
+
+# Initialize existing index if available
+if "query_engine" not in st.session_state:
+    existing_index = initialize_existing_index()
+    if existing_index:
+        st.session_state.query_engine = existing_index.as_query_engine(
+            streaming=True,
+            similarity_top_k=3,
+            text_qa_template=PromptTemplate(
+                "You are a helpful assistant that provides accurate answers based on the given context.\n"
+                "Context: {context_str}\n"
+                "Question: {query_str}\n"
+                "Answer:"
+            )
+        )
+        st.session_state.file_cache = {"preloaded": st.session_state.query_engine}
 
 @traceable(name="reset_chat")
 def reset_chat():
@@ -351,6 +403,11 @@ with st.sidebar:
                             st.write("Loading document...")
                             docs = loader.load_data()
                             
+                            # Add content hash to metadata for duplicate detection
+                            for doc in docs:
+                                content_hash = hashlib.md5(doc.text.encode()).hexdigest()
+                                doc.metadata["content_hash"] = content_hash
+                            
                             st.write("Setting up embedding model...")
                             embed_model = TracedHuggingFaceEmbedding(
                                 model_name="BAAI/bge-large-en-v1.5",
@@ -366,7 +423,7 @@ with st.sidebar:
                             Settings.chunk_size = 512
                             Settings.chunk_overlap = 50
                             
-                            st.write("Creating document index...")
+                            st.write("Creating/Updating document index...")
                             @traceable(name="create_index", run_type="embedding")
                             def create_index(documents):
                                 # Initialize Qdrant client
@@ -377,27 +434,65 @@ with st.sidebar:
                                     https=True
                                 )
                                 
-                                # Add connection verification
-                                try:
-                                    client.get_collections()
-                                except Exception as e:
-                                    st.error(f"Qdrant connection failed: {str(e)}")
-                                    st.stop()
-                                
                                 # Create Qdrant vector store
                                 vector_store = QdrantVectorStore(
                                     client=client,
                                     collection_name="deepseek_rag_docs"
                                 )
                                 
-                                # Create storage context
-                                storage_context = StorageContext.from_defaults(vector_store=vector_store)
+                                # Check if collection exists
+                                try:
+                                    client.get_collection("deepseek_rag_docs")
+                                    collection_exists = True
+                                except Exception:
+                                    collection_exists = False
                                 
-                                return VectorStoreIndex.from_documents(
-                                    documents,
-                                    storage_context=storage_context,
-                                    show_progress=True
-                                )
+                                if collection_exists:
+                                    st.write("Updating existing collection...")
+                                    # Load existing index
+                                    index = VectorStoreIndex.from_vector_store(vector_store)
+                                    
+                                    # Filter out existing documents by content hash
+                                    new_docs = []
+                                    for doc in documents:
+                                        # Check if document with same hash exists
+                                        result = client.scroll(
+                                            collection_name="deepseek_rag_docs",
+                                            scroll_filter=Filter(
+                                                must=[
+                                                    FieldCondition(
+                                                        key="metadata.content_hash",
+                                                        match=MatchValue(value=doc.metadata["content_hash"])
+                                                    )
+                                                ]
+                                            ),
+                                            limit=1
+                                        )
+                                        if not result[0]:  # No existing document with this hash
+                                            new_docs.append(doc)
+                                    
+                                    if not new_docs:
+                                        st.info("No new content found in uploaded documents")
+                                        return index
+                                        
+                                    # Add only new documents
+                                    storage_context = StorageContext.from_defaults(vector_store=vector_store)
+                                    index = VectorStoreIndex.from_documents(
+                                        new_docs,
+                                        storage_context=storage_context,
+                                        show_progress=True
+                                    )
+                                else:
+                                    st.write("Creating new collection...")
+                                    # Create new collection with all documents
+                                    storage_context = StorageContext.from_defaults(vector_store=vector_store)
+                                    index = VectorStoreIndex.from_documents(
+                                        documents,
+                                        storage_context=storage_context,
+                                        show_progress=True
+                                    )
+                                
+                                return index
                             
                             index = create_index(docs)
                             return index
