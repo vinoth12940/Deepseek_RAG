@@ -9,3 +9,5 @@ torch
 transformers
 sentence-transformers
 pypdf
+qdrant-client
+llama-index-vector-stores-qdrant

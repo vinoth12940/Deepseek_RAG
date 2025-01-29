@@ -26,6 +26,9 @@ from llama_index.core.llms import (
 from llama_index.core import PromptTemplate
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.core import VectorStoreIndex, ServiceContext, SimpleDirectoryReader
+from qdrant_client import QdrantClient
+from llama_index.vector_stores.qdrant import QdrantVectorStore
+from llama_index.core import StorageContext
 
 # Configure page settings
 st.set_page_config(
@@ -366,8 +369,33 @@ with st.sidebar:
                             st.write("Creating document index...")
                             @traceable(name="create_index", run_type="embedding")
                             def create_index(documents):
+                                # Initialize Qdrant client
+                                client = QdrantClient(
+                                    url=os.getenv("QDRANT_URL"),
+                                    api_key=os.getenv("QDRANT_API_KEY"),
+                                    prefer_grpc=True,
+                                    https=True
+                                )
+                                
+                                # Add connection verification
+                                try:
+                                    client.get_collections()
+                                except Exception as e:
+                                    st.error(f"Qdrant connection failed: {str(e)}")
+                                    st.stop()
+                                
+                                # Create Qdrant vector store
+                                vector_store = QdrantVectorStore(
+                                    client=client,
+                                    collection_name="deepseek_rag_docs"
+                                )
+                                
+                                # Create storage context
+                                storage_context = StorageContext.from_defaults(vector_store=vector_store)
+                                
                                 return VectorStoreIndex.from_documents(
                                     documents,
+                                    storage_context=storage_context,
                                     show_progress=True
                                 )
                             
@@ -396,6 +424,7 @@ with st.sidebar:
 
                         st.write("Caching results...")
                         st.session_state.file_cache[file_key] = query_engine
+                        st.session_state.query_engine = query_engine
                     except Exception as e:
                         st.error(f"Error during document processing: {str(e)}")
                         import traceback
@@ -403,6 +432,7 @@ with st.sidebar:
                         st.stop()
                 else:
                     query_engine = st.session_state.file_cache[file_key]
+                    st.session_state.query_engine = query_engine
 
                 st.success("Ready to Chat!")
                 display_pdf(uploaded_file)
@@ -452,7 +482,11 @@ if prompt := st.chat_input("What's up?"):
         full_response = ""
         
         try:
-            streaming_response = query_engine.query(prompt)
+            if 'query_engine' not in st.session_state:
+                st.error("Please upload a PDF document first!")
+                st.stop()
+                
+            streaming_response = st.session_state.query_engine.query(prompt)
             for chunk in streaming_response.response_gen:
                 full_response += chunk
                 message_placeholder.markdown(full_response + "▌")
