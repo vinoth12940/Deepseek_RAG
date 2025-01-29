@@ -35,16 +35,34 @@ graph TD
         P --> Q["5.3 Stream to UI"]
     end
 
+    subgraph Monitoring["LangSmith Monitoring"]
+        T["6.1 Trace Operations"]
+        R["6.2 Monitor Embeddings"]
+        S["6.3 Track LLM Calls"]
+        
+        T --> R
+        R --> S
+    end
+
     M -->|"4.8"| G
     N -->|"4.8"| G
     Q -->|"5.4"| G
 
+    %% LangSmith Monitoring Connections
+    K -.->|"Monitor"| R
+    P -.->|"Monitor"| S
+    B -.->|"Trace"| T
+    F -.->|"Trace"| T
+    O -.->|"Trace"| T
+
     classDef default fill:#f9f9f9,stroke:#333,stroke-width:2px
     classDef process fill:#bbdefb,stroke:#333,stroke-width:2px
     classDef special fill:#ffecb3,stroke:#333,stroke-width:2px
+    classDef monitor fill:#e8f5e9,stroke:#333,stroke-width:2px
     
     class A,B,C,D,E,F,G,H,I,J,K,L,M,N,O,P,Q process
     class Frontend,Database,QueryEngine,Processing,LLM special
+    class T,R,S monitor
 ```
 
 Flow Sequence:
@@ -76,5 +94,10 @@ Flow Sequence:
 5. LLM Processing (DeepSeek)
    - 5.1 Retrieve Relevant Context
    - 5.2 Generate Response using DeepSeek LLM
-   - 5.3 Stream Response to UI
+   - 5.3 Stream to UI
    - 5.4 Return to Wait State
+
+6. LangSmith Monitoring
+   - 6.1 Trace All Operations
+   - 6.2 Monitor Embedding Generation
+   - 6.3 Track LLM Interactions
