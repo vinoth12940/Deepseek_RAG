@@ -141,7 +141,7 @@ class DeepSeekLLM(LLM):
     def __init__(
         self,
         api_key: Optional[str] = None,
-        model: str = "deepseek-chat",
+        model: str = "deepseek-reasoner",
         temperature: float = 0.3,
         max_tokens: int = 1024,
         **kwargs: Any,
@@ -169,49 +169,45 @@ class DeepSeekLLM(LLM):
 
     @traceable(name="deepseek_complete")
     def complete(self, prompt: str, **kwargs: Any) -> CompletionResponse:
-        messages = [
-            {"role": "system", "content": "You are a helpful assistant that answers questions based on the provided context."},
-            {"role": "user", "content": prompt}
-        ]
-        
         response = self._client.chat.completions.create(
             model=self.model,
-            messages=messages,
+            messages=[{"role": "user", "content": prompt}],
             temperature=self.temperature,
             max_tokens=self.max_tokens,
             stream=False
         )
-        
         return CompletionResponse(text=response.choices[0].message.content)
 
     @traceable(name="deepseek_stream_complete")
     def stream_complete(self, prompt: str, **kwargs: Any) -> CompletionResponseGen:
-        messages = [
-            {"role": "system", "content": "You are a helpful assistant that answers questions based on the provided context."},
-            {"role": "user", "content": prompt}
-        ]
-        
         response = self._client.chat.completions.create(
             model=self.model,
-            messages=messages,
+            messages=[{"role": "user", "content": prompt}],
             temperature=self.temperature,
             max_tokens=self.max_tokens,
             stream=True
         )
         
         def gen() -> CompletionResponseGen:
-            text = ""
+            cot_text = ""
+            final_text = ""
             for chunk in response:
-                if chunk.choices[0].delta.content is not None:
-                    text += chunk.choices[0].delta.content
-                    yield CompletionResponse(text=text, delta=chunk.choices[0].delta.content)
+                # Handle reasoning content (CoT)
+                if chunk.choices[0].delta.reasoning_content:
+                    cot_text += chunk.choices[0].delta.reasoning_content
+                    yield CompletionResponse(text=cot_text, delta=chunk.choices[0].delta.reasoning_content)
+                
+                # Handle final answer content
+                if chunk.choices[0].delta.content:
+                    final_text += chunk.choices[0].delta.content
+                    yield CompletionResponse(text=final_text, delta=chunk.choices[0].delta.content)
         
         return gen()
 
     @traceable(name="deepseek_chat")
     def chat(self, messages: List[ChatMessage], **kwargs: Any) -> CompletionResponse:
         formatted_messages = [
-            {"role": msg.role.value, "content": msg.content}
+            {"role": "user" if msg.role.value == "system" else msg.role.value, "content": msg.content}
             for msg in messages
         ]
         
@@ -228,7 +224,7 @@ class DeepSeekLLM(LLM):
     @traceable(name="deepseek_stream_chat")
     def stream_chat(self, messages: List[ChatMessage], **kwargs: Any) -> CompletionResponseGen:
         formatted_messages = [
-            {"role": msg.role.value, "content": msg.content}
+            {"role": "user" if msg.role.value == "system" else msg.role.value, "content": msg.content}
             for msg in messages
         ]
         
@@ -241,11 +237,18 @@ class DeepSeekLLM(LLM):
         )
         
         def gen() -> CompletionResponseGen:
-            text = ""
+            cot_text = ""
+            final_text = ""
             for chunk in response:
-                if chunk.choices[0].delta.content is not None:
-                    text += chunk.choices[0].delta.content
-                    yield CompletionResponse(text=text, delta=chunk.choices[0].delta.content)
+                # Handle reasoning content (CoT)
+                if chunk.choices[0].delta.reasoning_content:
+                    cot_text += chunk.choices[0].delta.reasoning_content
+                    yield CompletionResponse(text=cot_text, delta=chunk.choices[0].delta.reasoning_content)
+                
+                # Handle final answer content
+                if chunk.choices[0].delta.content:
+                    final_text += chunk.choices[0].delta.content
+                    yield CompletionResponse(text=final_text, delta=chunk.choices[0].delta.content)
         
         return gen()
 
@@ -317,9 +320,13 @@ if "query_engine" not in st.session_state:
             similarity_top_k=3,
             text_qa_template=PromptTemplate(
                 "You are a helpful assistant that provides accurate answers based on the given context.\n"
-                "Context: {context_str}\n"
-                "Question: {query_str}\n"
-                "Answer:"
+                "Context information is below:\n"
+                "---------------------\n"
+                "{context_str}\n"
+                "---------------------\n"
+                "Given this context, answer the question: {query_str}\n"
+                "If the answer isn't in the context, say 'I couldn't find this information in the document.' "
+                "Otherwise, provide a detailed answer. Answer:"
             )
         )
         st.session_state.file_cache = {"preloaded": st.session_state.query_engine}
@@ -455,33 +462,29 @@ with st.sidebar:
                                     # Filter out existing documents by content hash
                                     new_docs = []
                                     for doc in documents:
-                                        # Check if document with same hash exists
-                                        result = client.scroll(
+                                        # Properly check for existing documents
+                                        existing_docs = client.count(
                                             collection_name="deepseek_rag_docs",
-                                            scroll_filter=Filter(
+                                            count_filter=Filter(
                                                 must=[
                                                     FieldCondition(
                                                         key="metadata.content_hash",
                                                         match=MatchValue(value=doc.metadata["content_hash"])
                                                     )
                                                 ]
-                                            ),
-                                            limit=1
-                                        )
-                                        if not result[0]:  # No existing document with this hash
+                                            )
+                                        ).count
+                                        
+                                        if existing_docs == 0:  # Only add if no existing documents with this hash
                                             new_docs.append(doc)
                                     
                                     if not new_docs:
                                         st.info("No new content found in uploaded documents")
                                         return index
                                         
-                                    # Add only new documents
-                                    storage_context = StorageContext.from_defaults(vector_store=vector_store)
-                                    index = VectorStoreIndex.from_documents(
-                                        new_docs,
-                                        storage_context=storage_context,
-                                        show_progress=True
-                                    )
+                                    # Add only new documents to existing index
+                                    index.insert_nodes(new_docs)
+                                    st.success(f"Added {len(new_docs)} new documents to existing collection")
                                 else:
                                     st.write("Creating new collection...")
                                     # Create new collection with all documents
@@ -501,14 +504,14 @@ with st.sidebar:
 
                         st.write("Setting up query engine...")
                         qa_template = PromptTemplate(
-                            "You are a helpful assistant that provides accurate answers based on the given context. "
+                            "You are a helpful assistant that provides accurate answers based on the given context.\n"
                             "Context information is below:\n"
                             "---------------------\n"
                             "{context_str}\n"
                             "---------------------\n"
-                            "Given this context, please answer the question: {query_str}\n\n"
-                            "If the answer is not contained in the context, say 'I cannot find this information in the provided context.' "
-                            "Answer:"
+                            "Given this context, answer the question: {query_str}\n"
+                            "If the answer isn't in the context, say 'I couldn't find this information in the document.' "
+                            "Otherwise, provide a detailed answer. Answer:"
                         )
                         
                         query_engine = index.as_query_engine(
